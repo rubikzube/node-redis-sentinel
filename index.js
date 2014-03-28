@@ -47,18 +47,14 @@ Sentinel.prototype.createClient = function(masterName, opts) {
             client.stream.connect(port, host);
 
             // Hijack the emit method so that we can get in there and
-            // do any reconnection on errors, before raising it up the
+            // start reconnection on errors before raising it up the
             // stack...
             var oldEmit = client.emit;
             client.emit = function(eventName) {
-
-                // Has an error been hit?
                 if (eventName === 'error') {
                     hitError.apply(null, arguments);
-                } else {
-                    // Not an error - call the real emit...
-                    oldEmit.apply(client, arguments);
                 }
+                oldEmit.apply(client, arguments);
             };
 
             // Crude but may do for now. On error re-resolve the master
