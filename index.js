@@ -1,6 +1,6 @@
 var redis = require('redis'),
     net = require('net'),
-    Q = require('q');
+    when = require('when');
 
 function Sentinel(endpoints) {
 
@@ -10,6 +10,8 @@ function Sentinel(endpoints) {
     }
 
     this.endpoints = endpoints;
+    this.clients = [];
+    this.pubsub = [];
 }
 
 /**
@@ -19,7 +21,34 @@ function Sentinel(endpoints) {
  * @return {RedisClient}       the RedisClient for the desired endpoint
  */
 Sentinel.prototype.createClient = function(masterName, opts) {
+    // When the client is ready create another client and subscribe to the
+    // switch-master event. Then any time there is a message on the channel it
+    // must be a master change, so reconnect all clients. This avoids combining
+    // the pub/sub client with the normal client and interfering with whatever
+    // the user is trying to do.
+    if (this.pubsub.length == 0) {
+        var self = this;
+        var pubsubOpts = {};
+        pubsubOpts.role = "sentinel";
+        pubsubClient = this.createClientInternal(masterName, pubsubOpts);
+        pubsubClient.subscribe("+switch-master", function(error) {
+            if (error) {
+                console.error("Unable to subscribe to Sentinel PUBSUB",
+                              host, ":", port);
+            }
+        });
+        pubsubClient.on("message", function(channel, message) {
+            console.warn("Received +switch-master message from Redis Sentinel.",
+                         " Reconnecting clients.");
+            self.reconnectAllClients();
+        });
+        pubsubClient.on("error", function(error) {});
+        self.pubsub.push(pubsubClient);
+    }
+    return this.createClientInternal(masterName, opts);
+}
 
+Sentinel.prototype.createClientInternal = function(masterName, opts) {
     if (typeof masterName !== 'string') {
         opts = masterName;
         masterName = 'mymaster';
@@ -33,6 +62,7 @@ Sentinel.prototype.createClient = function(masterName, opts) {
 
     var netClient = new net.Socket();
     var client = new redis.RedisClient(netClient, opts);
+    this.clients.push(client);
 
     var self = this;
 
@@ -42,9 +72,12 @@ Sentinel.prototype.createClient = function(masterName, opts) {
                 return client.emit('error', err);
             }
 
-            client.port = port;
-            client.host = host;
-            client.stream.connect(port, host);
+            var connectionOption = {
+                port: port,
+                host: host
+            };
+            client.connectionOption = connectionOption;
+            client.stream.connect(connectionOption.port, connectionOption.host);
 
             // Hijack the emit method so that we can get in there and
             // start reconnection on errors before raising it up the
@@ -56,6 +89,23 @@ Sentinel.prototype.createClient = function(masterName, opts) {
                 }
                 oldEmit.apply(client, arguments);
             };
+
+            client.on('reconnecting', refreshEndpoints);
+
+            function refreshEndpoints() {
+                client.connectionOption.port = "";
+                client.connectionOption.host = "";
+                resolver(self.endpoints, masterName, function(_err, ip, port) {
+                    if (_err) {
+                        oldEmit.call(client, 'error', _err);
+                    } else {
+                        // Try reconnecting.
+                        client.connectionOption.port = port;
+                        client.connectionOption.host = ip;
+                        client.connection_gone("sentinel induced refresh");
+                    }
+                });
+            }
 
             // Crude but may do for now. On error re-resolve the master
             // and retry the connection
@@ -73,12 +123,7 @@ Sentinel.prototype.createClient = function(masterName, opts) {
                 // In the background the client is going to keep trying to reconnect
                 // and this error will keep getting raised - lets just keep trying
                 // to get a new master...
-                resolver(self.endpoints, masterName, function(_err, ip, port) {
-                    if (_err) { oldEmit.call(client, 'error', _err); }
-                    // Try and reconnect
-                    client.port = port;
-                    client.host = ip;
-                });
+                refreshEndpoints();
             }
         };
     }
@@ -99,6 +144,20 @@ Sentinel.prototype.createClient = function(masterName, opts) {
     return client;
 };
 
+
+/*
+ * Ensure that all clients are trying to reconnect.
+ */
+Sentinel.prototype.reconnectAllClients = function() {
+    this.clients.forEach(function(client) {
+        // It is safe to call this multiple times in quick succession, as
+        // might happen with multiple Sentinel instances. Each client
+        // records its reconnect state and will only try to reconnect if 
+        // not already doing so.
+        client.connection_gone("sentinel switch-master");
+    });
+};
+
 function resolveClient() {
     var _i, __slice = [].slice;
 
@@ -113,13 +172,13 @@ function resolveClient() {
      * We use the algorithm from http://redis.io/topics/sentinel-clients
      * to get a sentinel client and then do 'stuff' with it
      */
-    var promise = Q.resolve();
+    var promise = when.resolve();
 
     // Because finding the master is going to be an async list we will terminate
     // when we find one then use promises...
     promise = endpoints.reduce(function(soFar, endpoint) {
         return soFar.then(function() {
-            var deferred = Q.defer();
+            var deferred = when.defer();
 
             // Farily illegible way of passing (endpoint, arg1, arg2, ..., callback)
             // to checkEndpointFn
@@ -150,7 +209,7 @@ function resolveClient() {
     });
 
     // Catch the failure (if there is one)
-    promise.fail(function(err) { callback(err); });
+    promise.catch(function(err) { callback(err); });
 }
 
 function isSentinelOk(endpoint, callback) {
@@ -195,7 +254,7 @@ function getMasterFromEndpoint(endpoint, masterName, callback) {
 
         // Test the response
         if (result === null) {
-            callback(new Error("Unkown master name: " + masterName));
+            callback(new Error("Unknown master name: " + masterName));
         } else {
             var ip = result[0];
             var port = result[1];
@@ -226,18 +285,20 @@ function getSlaveFromEndpoint(endpoint, masterName, callback) {
 
         // Test the response
         if (result === null) {
-            callback(new Error("Unkown master name: " + masterName));
+            callback(new Error("Unknown master name: " + masterName));
         } else if(result.length === 0){
             callback(new Error("No slaves linked to the master."));
         } else {
             var slaveInfoArr = result[Math.floor(Math.random() * result.length)]; //range 0 to result.length -1
             if((slaveInfoArr.length % 2) > 0){
                 callback(new Error("Corrupted response from the sentinel"));
+            } else {
+              var slaveInfo = parseSentinelResponse(slaveInfoArr);
+              callback(null, slaveInfo.ip, slaveInfo.port);
             }
-            var slaveInfo = parseSentinelResponse(slaveInfoArr);
-            callback(null, slaveInfo.ip, slaveInfo.port);
         }
     });
+    sentinelClient.quit();
 }
 
 function resolveSentinelClient(endpoints, masterName, callback) {
