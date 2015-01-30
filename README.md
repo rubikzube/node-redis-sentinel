@@ -1,3 +1,6 @@
+>This is a direct fork of node-redis-sentinel with one minor difference, it allows errors to bubble up the stack so that they can be logged.
+
+
 node-redis-sentinel
 ===================
 
